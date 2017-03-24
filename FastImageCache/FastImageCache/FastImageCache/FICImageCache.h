@@ -78,7 +78,7 @@ NS_ASSUME_NONNULL_BEGIN
  
  @see [FICImageCache dispatchQueue]
  */
-+ (instancetype)sharedImageCache;
++ (instancetype)sharedImageCache;//default namespace的imageCache
 
 /**
  Returns the shared dispatch queue used by all instances of `FICImageCache`.
