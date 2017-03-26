@@ -54,17 +54,18 @@ static NSString *const FICImageTableFormatKey = @"format";
     NSCountedSet *_chunkSet;
     
     NSRecursiveLock *_lock;
-    CFMutableDictionaryRef _indexNumbers;
+    CFMutableDictionaryRef _indexNumbers; // 键为entryIndex，值为包装了entryIndex的NSNumber
     
     // Image table metadata
+    // 一张FICImageTable的metadata包括indexMap（键为entityUUID，值为entryIndex的字典），sourceImageMap（键为entityUUID，值为sourceImageUUID的字典），MRUEntries（包含Most Recently Used Entries的有序集合，序号越小，使用时间越近），imageFormatDictionary（存储在这张FICImageTable中的图片的格式信息）
     NSMutableDictionary *_indexMap;         // Key: entity UUID, value: integer index into the table file
     NSMutableDictionary *_sourceImageMap;   // Key: entity UUID, value: source image UUID
-    NSMutableIndexSet *_occupiedIndexes;
-    NSMutableOrderedSet *_MRUEntries;
-    NSCountedSet *_inUseEntries;
-    NSDictionary *_imageFormatDictionary;
+    NSMutableIndexSet *_occupiedIndexes; // 被占用的entry的index的集合
+    NSMutableOrderedSet *_MRUEntries; // 最近被访问(包括存储和提取操作)的entry的集合
+    NSCountedSet *_inUseEntries; // 正在被｀- (nullable UIImage *)newImageForEntityUUID:｀提取缓存图片的entry集合
+    NSDictionary *_imageFormatDictionary; //存储在这张FICImageTable中的图片的格式信息
     int32_t _metadataVersion;
-
+    
     NSString *_fileDataProtectionMode;
     BOOL _canAccessData;
 }
@@ -112,7 +113,7 @@ static NSString *const FICImageTableFormatKey = @"format";
     dispatch_once(&onceToken, ^{
         __pageSize = getpagesize();
     });
-
+    
     return __pageSize;
 }
 
@@ -159,6 +160,7 @@ static NSString *const FICImageTableFormatKey = @"format";
         
         CGSize pixelSize = [_imageFormat pixelSize];
         NSInteger bytesPerPixel = [_imageFormat bytesPerPixel];
+        //使行字节数为64整数倍
         _imageRowLength = (NSInteger)FICByteAlignForCoreAnimation(pixelSize.width * bytesPerPixel);
         _imageLength = _imageRowLength * (NSInteger)pixelSize.height;
         
@@ -170,7 +172,7 @@ static NSString *const FICImageTableFormatKey = @"format";
         
         _MRUEntries = [[NSMutableOrderedSet alloc] init];
         _inUseEntries = [NSCountedSet set];
-
+        
         _sourceImageMap = [[NSMutableDictionary alloc] init];
         
         _filePath = [[self tableFilePath] copy];
@@ -191,7 +193,7 @@ static NSString *const FICImageTableFormatKey = @"format";
             [attributes setValue:[_imageFormat protectionModeString] forKeyPath:NSFileProtectionKey];
             [fileManager createFileAtPath:_filePath contents:nil attributes:attributes];
         }
-       
+        
         NSDictionary *attributes = [fileManager attributesOfItemAtPath:_filePath error:NULL];
         _fileDataProtectionMode = [attributes objectForKey:NSFileProtectionKey];
         
@@ -225,9 +227,9 @@ static NSString *const FICImageTableFormatKey = @"format";
             // If something goes wrong and we can't open the image table file, then we have no choice but to release and nil self.
             NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s could not open the image table file at path %@. The image table was not created.", __PRETTY_FUNCTION__, _filePath];
             [self.imageCache _logMessage:message];
-
+            
             self = nil;
-        }    
+        }
     }
     
     return self;
@@ -266,7 +268,7 @@ static NSString *const FICImageTableFormatKey = @"format";
             if (chunkOffset + chunkLength > _fileLength) {
                 chunkLength = (size_t)(_fileLength - chunkOffset);
             }
-                    
+            
             chunk = [[FICImageTableChunk alloc] initWithFileDescriptor:_fileDescriptor index:index length:chunkLength];
             [self _setChunk:chunk index:index];
         }
@@ -281,14 +283,14 @@ static NSString *const FICImageTableFormatKey = @"format";
 }
 
 #pragma mark - Storing, Retrieving, and Deleting Entries
-
+//为entityUUID对应的entity获取、解压缩并存储图片到本FICImageTable的一个entry中
 - (void)setEntryForEntityUUID:(NSString *)entityUUID sourceImageUUID:(NSString *)sourceImageUUID imageDrawingBlock:(FICEntityImageDrawingBlock)imageDrawingBlock {
     if (entityUUID != nil && sourceImageUUID != nil && imageDrawingBlock != NULL) {
         [_lock lock];
         
         NSInteger newEntryIndex = [self _indexOfEntryForEntityUUID:entityUUID];
-        if (newEntryIndex == NSNotFound) {
-            newEntryIndex = [self _nextEntryIndex];
+        if (newEntryIndex == NSNotFound) {//没有此entityUUID对应的entry
+            newEntryIndex = [self _nextEntryIndex];//分配entry(可能需要分配新的chunk)，返回entryIndex，若缓存已满，则删除最久没被访问的entry，将此entry分配给新的entityUUID
             
             if (newEntryIndex >= _entryCount) {
                 // Determine how many chunks we need to support new entry index.
@@ -326,17 +328,17 @@ static NSString *const FICImageTableFormatKey = @"format";
                 
                 // Relinquish the image table lock before calling potentially slow imageDrawingBlock to unblock other FIC operations
                 [_lock unlock];
-                
+                // CoreGraphics绘制操作，直接将图绘制在存储它的地方
                 CGContextRef context = CGBitmapContextCreate([entryData bytes], pixelSize.width, pixelSize.height, bitsPerComponent, _imageRowLength, colorSpace, bitmapInfo);
                 
                 CGContextTranslateCTM(context, 0, pixelSize.height);
                 CGContextScaleCTM(context, _screenScale, -_screenScale);
-                
+                // 创建并获取以indexNumber为标记的锁，若此锁已经存在并被其他线程获取，则需等待
                 @synchronized(indexNumber) {
                     // Call drawing block to allow client to draw into the context
                     imageDrawingBlock(context, [_imageFormat imageSize]);
                     CGContextRelease(context);
-                
+                    
                     // Write the data back to the filesystem
                     [entryData flush];
                 }
@@ -350,13 +352,13 @@ static NSString *const FICImageTableFormatKey = @"format";
         }
     }
 }
-
+//从本FICImageTable从提取为entityUUID对应的entity缓存的已经解压缩的图片
 - (UIImage *)newImageForEntityUUID:(NSString *)entityUUID sourceImageUUID:(NSString *)sourceImageUUID preheatData:(BOOL)preheatData {
     UIImage *image = nil;
     
     if (entityUUID != nil && sourceImageUUID != nil) {
         [_lock lock];
-
+        
         FICImageTableEntry *entryData = [self _entryDataForEntityUUID:entityUUID];
         if (entryData != nil) {
             NSString *entryEntityUUID = FICStringWithUUIDBytes([entryData entityUUIDBytes]);
@@ -379,7 +381,7 @@ static NSString *const FICImageTableFormatKey = @"format";
                     __weak FICImageTable *weakSelf = self;
                     [entryData executeBlockOnDealloc:^{
                         [weakSelf removeInUseForEntityUUID:entityUUID];
-                    }];
+                    }];// entryData被销毁时(entryData是本方法中的一个局部变量，它被销毁时本方法已执行完，缓存图片已被提取返回)，将entityUUID从正在被使用的entityUUID集合中删除
                     
                     CGSize pixelSize = [_imageFormat pixelSize];
                     CGBitmapInfo bitmapInfo = [_imageFormat bitmapInfo];
@@ -449,7 +451,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
 
 - (BOOL)entryExistsForEntityUUID:(NSString *)entityUUID sourceImageUUID:(NSString *)sourceImageUUID {
     BOOL imageExists = NO;
-
+    
     [_lock lock];
     
     FICImageTableEntry *entryData = [self _entryDataForEntityUUID:entityUUID];
@@ -481,7 +483,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
 }
 
 - (void)_setEntryCount:(NSInteger)entryCount {
-    if (entryCount != _entryCount) {        
+    if (entryCount != _entryCount) {
         off_t fileLength = entryCount * _entryLength;
         int result = ftruncate(_fileDescriptor, fileLength);
         
@@ -539,7 +541,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
     FICImageTableEntry *entryData = nil;
     
     [_lock lock];
-
+    
     BOOL canAccessData = [self canAccessEntryData];
     if (index < _entryCount && canAccessData) {
         off_t entryOffset = index * _entryLength;
@@ -557,7 +559,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
                 [entryData setImageCache:self.imageCache];
                 [entryData setIndex:index];
                 [_chunkSet addObject:chunk];
-            
+                
                 __weak FICImageTable *weakSelf = self;
                 [entryData executeBlockOnDealloc:^{
                     [weakSelf _entryWasDeallocatedFromChunk:chunk];
@@ -601,14 +603,14 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
     
     if (index >= [self _maximumCount] && [_MRUEntries count]) {
         // Evict the oldest/least-recently accessed entry here
-
+        
         NSString *oldestEvictableEntityUUID = [self oldestEvictableEntityUUID];
         if (oldestEvictableEntityUUID) {
             [self deleteEntryForEntityUUID:oldestEvictableEntityUUID];
             index = [self _nextEntryIndex];
         }
     }
-
+    
     if (index >= [self _maximumCount]) {
         NSString *message = [NSString stringWithFormat:@"FICImageTable - unable to evict entry from table '%@' to make room. New index %ld, desired max %ld", [_imageFormat name], (long)index, (long)[self _maximumCount]];
         [self.imageCache _logMessage:message];
@@ -620,13 +622,13 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
 - (NSString *)oldestEvictableEntityUUID {
     NSString *uuid = nil;
     for (NSInteger i = [_MRUEntries count] - 1; i >= 0; i--) {
-        NSString *candidateUUID = [_MRUEntries objectAtIndex:i];
+        NSString *candidateUUID = [_MRUEntries objectAtIndex:i]; // 从后面数起，第一个不是正在被提取图片的entry
         if (![_inUseEntries containsObject:candidateUUID]) {
             uuid = candidateUUID;
             break;
         }
     }
-
+    
     return uuid;
 }
 
@@ -656,7 +658,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
     
     return entryData;
 }
-
+// 将被访问过的entry的entryIndex加入_MRUEntries, 即`- (void)setEntryForEntityUUID:sourceImageUUID:imageDrawingBlock:`和`- (nullable UIImage *)newImageForEntityUUID:sourceImageUUID:(nonnull NSString *)sourceImageUUID preheatData:`中访问过的entry
 - (void)_entryWasAccessedWithEntityUUID:(NSString *)entityUUID {
     // Update MRU array
     NSInteger index = [_MRUEntries indexOfObject:entityUUID];
@@ -679,7 +681,7 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
 }
 
 #pragma mark - Working with Metadata
-
+// 一张FICImageTable的metadata包括indexMap（键为entityUUID，值为entryIndex的字典），sourceImageMap（键为entityUUID，值为sourceImageUUID的字典），MRUEntries（包含Most Recently Used Entries的有序集合，序号越小，使用时间越近），imageFormatDictionary（存储在这张FICImageTable中的图片的格式信息
 - (void)saveMetadata {
     @autoreleasepool {
         [_lock lock];
@@ -689,31 +691,32 @@ static void _FICReleaseImageData(void *info, const void *data, size_t size) {
                                             [_sourceImageMap copy], FICImageTableContextMapKey,
                                             [[_MRUEntries array] copy], FICImageTableMRUArrayKey,
                                             [_imageFormatDictionary copy], FICImageTableFormatKey, nil];
-
+        
         __block int32_t metadataVersion = OSAtomicIncrement32(&_metadataVersion);
-
+        
         [_lock unlock];
         
         static dispatch_queue_t __metadataQueue = nil;
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            __metadataQueue = dispatch_queue_create("com.path.FastImageCache.ImageTableMetadataQueue", NULL);
+            __metadataQueue = dispatch_queue_create("com.path.FastImageCache.ImageTableMetadataQueue", NULL);// 创建的是serialQueue
         });
         
         dispatch_async(__metadataQueue, ^{
             // Cancel serialization if a new metadata version is queued to be saved
+            // metadataVersion并不是在__metadataQueue上改变的，若是在这个block执行前metadataVersion又更新了，那么直接返回，不需要执行这个block
             if (metadataVersion != _metadataVersion) {
                 return;
             }
-
+            
             @autoreleasepool {
                 NSData *data = [NSJSONSerialization dataWithJSONObject:metadataDictionary options:kNilOptions error:NULL];
-
+                
                 // Cancel disk writing if a new metadata version is queued to be saved
                 if (metadataVersion != _metadataVersion) {
                     return;
                 }
-
+                
                 BOOL fileWriteResult = [data writeToFile:[self metadataFilePath] atomically:NO];
                 if (fileWriteResult == NO) {
                     NSString *message = [NSString stringWithFormat:@"*** FIC Error: %s couldn't write metadata for format %@", __PRETTY_FUNCTION__, [_imageFormat name]];
